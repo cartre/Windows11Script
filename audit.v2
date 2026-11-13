@@ -1,0 +1,96 @@
+<#
+.SYNOPSIS
+  Windows 11 comprehensive audit and limited baseline fixes for CyberPatriot and Oklahoma Cup.
+.DESCRIPTION
+  Runs the original 31 audit checks, enables existing firewall profiles and
+  selected auditing subcategories, and verifies the results. Writes one TXT
+  report next to this script in Results and opens it in Notepad.
+  Does not delete users, remove software, alter passwords, exclusions, RDP,
+  shares, or services. Check the image README before running.
+.PARAMETER Deep
+  Also search common user/data folders for suspicious filenames (slower).
+#>
+[CmdletBinding()]
+param([switch]$Deep)
+
+$ErrorActionPreference = 'Continue'
+$started = Get-Date
+$desktop = [Environment]::GetFolderPath('Desktop')
+if (-not (Test-Path -LiteralPath $desktop)) { $desktop = (Get-Location).Path }
+$baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { $desktop }
+$resultsDir = Join-Path $baseDir 'Results'
+if (-not (Test-Path -LiteralPath $resultsDir)) { New-Item -Path $resultsDir -ItemType Directory -Force | Out-Null }
+$report = Join-Path $resultsDir ('Windows11-Audit-v2-{0}-{1}.txt' -f $env:COMPUTERNAME,(Get-Date -Format 'yyyyMMdd-HHmmss'))
+$script:findings = New-Object 'System.Collections.Generic.List[string]'
+$script:changeLog = New-Object 'System.Collections.Generic.List[string]'
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+function Write-Report {
+    param([string]$Text)
+    Add-Content -LiteralPath $script:report -Value $Text -Encoding UTF8
+}
+function Add-Finding { param([string]$Status, [string]$Message)
+    [void]$script:findings.Add(('[{0}] {1}' -f $Status, $Message))
+}
+function Record-Change { param([string]$Status, [string]$Message)
+    [void]$script:changeLog.Add(('[{0}] {1}' -f $Status, $Message))
+}
+function Invoke-Check {
+    param([string]$Title, [scriptblock]$Check)
+    Write-Host ('[+] {0}' -f $Title)
+    Write-Report ''
+    Write-Report ('=' * 70)
+    Write-Report $Title
+    Write-Report ('=' * 70)
+    try {
+        $result = & $Check 2>&1 | Out-String -Width 260
+        if ([string]::IsNullOrWhiteSpace($result)) { $result = '(none found, unavailable, or no output)' }
+        Write-Report $result.TrimEnd()
+    } catch {
+        Write-Report ('[ERROR] {0}' -f $_.Exception.Message)
+    }
+}
+function Read-Registry {
+    param([string]$Path, [string[]]$Names)
+    foreach ($name in $Names) {
+        try {
+            $properties = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+            $property = $properties.PSObject.Properties[$name]
+            $value = if ($null -eq $property) { '<not set>' } else { $property.Value -join ', ' }
+        } catch { $value = '<key missing>' }
+        [pscustomobject]@{Setting=$name;Value=$value;Path=$Path}
+    }
+}
+function Get-Software {
+    $paths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName } |
+        Select-Object DisplayName,DisplayVersion,Publisher,InstallLocation |
+        Sort-Object DisplayName -Unique
+}
+
+Write-Report 'WINDOWS 11 SECURITY AUDIT v2 - AUDIT + LIMITED AUTOMATIC FIXES'
+Write-Report ('Started: {0}' -f $started)
+Write-Report ('Computer: {0}' -f $env:COMPUTERNAME)
+Write-Report ('User: {0}' -f [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+Write-Report ('Administrator: {0}' -f $admin)
+Write-Report ('PowerShell: {0}' -f $PSVersionTable.PSVersion)
+Write-Report ('Deep search: {0}' -f [bool]$Deep)
+Write-Report 'IMPORTANT: The README determines which users, services, and applications are authorized.'
+Write-Report 'Changes: enable firewall profiles and selected advanced auditing policies. No deletions or service changes.'
+if (-not $admin) {
+    Write-Warning 'Not running as Administrator. Some checks may be incomplete.'
+    Write-Report 'WARNING: Run PowerShell as Administrator for the fullest report.'
+}
+
+# LIMITED FIXES: run once, no prompts; native commands checked by exit code.
+Invoke-Check '00A - Firewall before/after (automatic baseline)' {
+    $before = @(Get-NetFirewallProfile -ErrorAction Stop)
+    'BEFORE:'
+    $before | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction | Format-Table -AutoSize
+    if (-not $admin) {
