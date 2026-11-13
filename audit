@@ -1,0 +1,245 @@
+<#
+.SYNOPSIS
+  Read-only Windows 11 security audit for CyberPatriot and Oklahoma Cup.
+.DESCRIPTION
+  Produces a timestamped text report on the Desktop. It does not change security
+  settings, accounts, services, firewall rules, or installed software.
+  Review the competition README before making any changes yourself.
+.PARAMETER Deep
+  Also search common user/data folders for suspicious filenames (slower).
+#>
+[CmdletBinding()]
+param([switch]$Deep)
+
+$ErrorActionPreference = 'Continue'
+$started = Get-Date
+$desktop = [Environment]::GetFolderPath('Desktop')
+if (-not (Test-Path -LiteralPath $desktop)) { $desktop = (Get-Location).Path }
+$report = Join-Path $desktop ('Windows11-Audit-{0}.txt' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+
+function Write-Report {
+    param([string]$Text)
+    Add-Content -LiteralPath $script:report -Value $Text -Encoding UTF8
+}
+function Invoke-Check {
+    param([string]$Title, [scriptblock]$Check)
+    Write-Host ('[+] {0}' -f $Title)
+    Write-Report ''
+    Write-Report ('=' * 70)
+    Write-Report $Title
+    Write-Report ('=' * 70)
+    try {
+        $result = & $Check 2>&1 | Out-String -Width 260
+        if ([string]::IsNullOrWhiteSpace($result)) { $result = '(none found, unavailable, or no output)' }
+        Write-Report $result.TrimEnd()
+    } catch {
+        Write-Report ('[ERROR] {0}' -f $_.Exception.Message)
+    }
+}
+function Read-Registry {
+    param([string]$Path, [string[]]$Names)
+    foreach ($name in $Names) {
+        try {
+            $properties = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+            $property = $properties.PSObject.Properties[$name]
+            $value = if ($null -eq $property) { '<not set>' } else { $property.Value -join ', ' }
+        } catch { $value = '<key missing>' }
+        [pscustomobject]@{Setting=$name;Value=$value;Path=$Path}
+    }
+}
+function Get-Software {
+    $paths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName } |
+        Select-Object DisplayName,DisplayVersion,Publisher,InstallLocation |
+        Sort-Object DisplayName -Unique
+}
+
+Write-Report 'WINDOWS 11 SECURITY AUDIT - READ ONLY'
+Write-Report ('Started: {0}' -f $started)
+Write-Report ('Computer: {0}' -f $env:COMPUTERNAME)
+Write-Report ('User: {0}' -f [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+Write-Report ('Administrator: {0}' -f $admin)
+Write-Report ('PowerShell: {0}' -f $PSVersionTable.PSVersion)
+Write-Report ('Deep search: {0}' -f [bool]$Deep)
+Write-Report 'IMPORTANT: The README determines which users, services, and applications are authorized.'
+if (-not $admin) {
+    Write-Warning 'Not running as Administrator. Some checks may be incomplete.'
+    Write-Report 'WARNING: Run PowerShell as Administrator for the fullest report.'
+}
+
+Invoke-Check '01 - OS, build, and domain' {
+    Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber,LastBootUpTime | Format-List
+    Get-CimInstance Win32_ComputerSystem | Select-Object Name,Domain,PartOfDomain,Workgroup | Format-List
+}
+Invoke-Check '02 - Local users' {
+    Get-LocalUser | Select-Object Name,Enabled,PasswordRequired,PasswordLastSet,PasswordExpires,LastLogon,Description,SID | Format-Table -AutoSize -Wrap
+}
+Invoke-Check '03 - Local groups and members' {
+    foreach ($group in (Get-LocalGroup)) {
+        '--- ' + $group.Name
+        try { Get-LocalGroupMember -Group $group.Name -ErrorAction Stop | Select-Object Name,ObjectClass,PrincipalSource | Format-Table -AutoSize }
+        catch { '[group membership unavailable] ' + $_.Exception.Message }
+    }
+}
+Invoke-Check '04 - Password and lockout policy' { net accounts }
+Invoke-Check '05 - Security policy export' {
+    $tempFile = Join-Path $env:TEMP ('audit-secpol-{0}.inf' -f [guid]::NewGuid().ToString('N'))
+    try {
+        & secedit.exe /export /cfg $tempFile /quiet | Out-Null
+        if ($LASTEXITCODE -ne 0) { 'secedit exit code: ' + $LASTEXITCODE }
+        if (Test-Path -LiteralPath $tempFile) {
+            Get-Content -LiteralPath $tempFile -ErrorAction Stop |
+                Where-Object { $_ -match '^\[(System Access|Privilege Rights|Event Audit|Registry Values)\]' -or $_ -match '^(MinimumPassword|MaximumPassword|PasswordComplexity|PasswordHistory|Lockout|ClearTextPassword|Se[A-Z]|MACHINE\\)' }
+        } else { 'Security policy export unavailable. Try running elevated.' }
+    } finally {
+        Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+    }
+}
+Invoke-Check '06 - Advanced audit policy' { auditpol.exe /get /category:* }
+Invoke-Check '07 - Firewall profiles' {
+    Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction,LogBlocked | Format-Table -AutoSize
+}
+Invoke-Check '08 - Custom enabled inbound firewall allow rules' {
+    Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.DisplayGroup } |
+        Select-Object DisplayName,Name,Profile,Direction,Action | Format-Table -AutoSize -Wrap
+}
+Invoke-Check '09 - Defender status' {
+    Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,BehaviorMonitorEnabled,IoavProtectionEnabled,NISEnabled,IsTamperProtected,AntivirusSignatureLastUpdated | Format-List
+}
+Invoke-Check '10 - Defender configuration and exclusions' {
+    Get-MpPreference | Select-Object DisableRealtimeMonitoring,DisableBehaviorMonitoring,DisableScriptScanning,DisableRemovableDriveScanning,DisableEmailScanning,DisableArchiveScanning,PUAProtection,MAPSReporting,EnableNetworkProtection,ExclusionPath,ExclusionProcess,ExclusionExtension | Format-List
+}
+Invoke-Check '11 - Defender detected threats' {
+    Get-MpThreatDetection -ErrorAction SilentlyContinue | Select-Object -First 30 InitialDetectionTime,ThreatID,ProcessName,Resources | Format-List
+}
+Invoke-Check '12 - Important services' {
+    $names = @('WinDefend','mpssvc','wuauserv','BITS','EventLog','Schedule','RemoteRegistry','TermService','WinRM','Spooler','W3SVC','FTPSVC','sshd','SNMP','TlntSvr','LanmanServer','LanmanWorkstation','bthserv','SSDPSRV','upnphost')
+    Get-Service -Name $names -ErrorAction SilentlyContinue | Select-Object Name,Status,StartType,DisplayName | Sort-Object Name | Format-Table -AutoSize
+}
+Invoke-Check '13 - Nonstandard service executable paths' {
+    Get-CimInstance Win32_Service | Where-Object {
+        $_.PathName -and $_.PathName -notmatch '(?i)^"?[A-Z]:\\Windows\\|^"?[A-Z]:\\Program Files( \(x86\))?\\'
+    } | Select-Object Name,State,StartMode,StartName,PathName | Format-Table -AutoSize -Wrap
+}
+Invoke-Check '14 - TCP listening ports' {
+    Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Select-Object LocalAddress,LocalPort,OwningProcess,@{Name='Process';Expression={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} |
+        Sort-Object LocalPort | Format-Table -AutoSize
+}
+Invoke-Check '15 - Established TCP connections' {
+    Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
+        Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess | Format-Table -AutoSize
+}
+Invoke-Check '16 - SMB server / client settings' {
+    Get-SmbServerConfiguration | Select-Object EnableSMB1Protocol,EnableSMB2Protocol,RequireSecuritySignature,EncryptData,RejectUnencryptedAccess | Format-List
+    Get-SmbClientConfiguration | Select-Object RequireSecuritySignature,EnableInsecureGuestLogons | Format-List
+}
+Invoke-Check '17 - Network shares and access' {
+    foreach ($share in (Get-SmbShare -ErrorAction SilentlyContinue)) {
+        '--- ' + $share.Name + ' (' + $share.Path + ')'
+        Get-SmbShareAccess -Name $share.Name -ErrorAction SilentlyContinue | Select-Object AccountName,AccessControlType,AccessRight | Format-Table -AutoSize
+    }
+}
+Invoke-Check '18 - RDP and remote assistance settings' {
+    Read-Registry 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' @('fDenyTSConnections')
+    Read-Registry 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' @('UserAuthentication','SecurityLayer','MinEncryptionLevel','PortNumber')
+    Read-Registry 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' @('UserAuthentication','SecurityLayer','MinEncryptionLevel','fDenyTSConnections')
+    Read-Registry 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' @('fAllowToGetHelp','fAllowFullControl')
+    Get-ChildItem WSMan:\localhost\Listener -ErrorAction SilentlyContinue | Select-Object Name,Keys
+}
+Invoke-Check '19 - Security-related registry settings' {
+    Read-Registry 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' @('NoLMHash','LmCompatibilityLevel','LimitBlankPasswordUse','RestrictAnonymous','RestrictAnonymousSAM','RunAsPPL','EveryoneIncludesAnonymous')
+    Read-Registry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' @('EnableLUA','ConsentPromptBehaviorAdmin','PromptOnSecureDesktop','DontDisplayLastUserName')
+    Read-Registry 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' @('AutoAdminLogon','Shell','Userinit')
+    Read-Registry 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' @('NoDriveTypeAutoRun','NoAutorun')
+    Read-Registry 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' @('Enabled')
+}
+Invoke-Check '20 - Installed desktop applications' { Get-Software | Format-Table -AutoSize -Wrap }
+Invoke-Check '21 - Potentially unwanted / dual-use application names' {
+    $pattern = 'netcat|ncat|wireshark|nmap|zenmap|mimikatz|hashcat|hydra|ophcrack|teamviewer|anydesk|tightvnc|utorrent|bittorrent|steam|epic games|opera|ccleaner|metasploit'
+    Get-Software | Where-Object { $_.DisplayName -match $pattern } | Format-Table -AutoSize -Wrap
+    'A name match alone does not mean the application is unauthorized. Check the README.'
+}
+Invoke-Check '22 - Non-Microsoft Store apps' {
+    Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+        Where-Object { $_.Publisher -notlike '*Microsoft*' -and $_.SignatureKind -ne 'System' } |
+        Select-Object Name,Version | Sort-Object Name | Format-Table -AutoSize
+}
+Invoke-Check '23 - Enabled Windows optional features' {
+    Get-WindowsOptionalFeature -Online -ErrorAction SilentlyContinue |
+        Where-Object { $_.State -eq 'Enabled' } | Select-Object FeatureName | Format-Table -AutoSize
+}
+Invoke-Check '24 - Installed Windows updates' {
+    Get-HotFix -ErrorAction SilentlyContinue | Sort-Object InstalledOn -Descending |
+        Select-Object -First 35 HotFixID,Description,InstalledOn | Format-Table -AutoSize
+}
+Invoke-Check '25 - Startup commands and Run keys' {
+    Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location,User | Format-Table -AutoSize -Wrap
+    foreach ($path in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce')) {
+        if (Test-Path -LiteralPath $path) {
+            '--- ' + $path
+            (Get-ItemProperty -LiteralPath $path).PSObject.Properties |
+                Where-Object { $_.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$' } |
+                Select-Object Name,Value | Format-Table -AutoSize -Wrap
+        }
+    }
+}
+Invoke-Check '26 - Non-Microsoft scheduled tasks with actions' {
+    Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } |
+        Select-Object TaskName,TaskPath,State,@{Name='Actions';Expression={($_.Actions | ForEach-Object { $_.Execute + ' ' + $_.Arguments }) -join '; '}} |
+        Format-Table -AutoSize -Wrap
+}
+Invoke-Check '27 - WMI persistence subscriptions' {
+    foreach ($class in @('__EventFilter','CommandLineEventConsumer','ActiveScriptEventConsumer','__FilterToConsumerBinding')) {
+        '--- ' + $class
+        Get-CimInstance -Namespace root\subscription -ClassName $class -ErrorAction SilentlyContinue |
+            Select-Object __CLASS,Name,CommandLineTemplate,ScriptText,Filter,Consumer | Format-List
+    }
+}
+Invoke-Check '28 - Image File Execution Options debuggers' {
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options' -ErrorAction SilentlyContinue |
+        ForEach-Object { $debugger = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).Debugger; if ($debugger) { $_.PSChildName + ': ' + $debugger } }
+}
+Invoke-Check '29 - Hosts file entries' {
+    Get-Content -LiteralPath "$env:windir\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Trim() -and $_.Trim() -notmatch '^#' }
+}
+Invoke-Check '30 - Security event log status and recent failures' {
+    Get-WinEvent -ListLog Security,System,Application -ErrorAction SilentlyContinue |
+        Select-Object LogName,IsEnabled,RecordCount,MaximumSizeInBytes | Format-Table -AutoSize
+    Get-WinEvent -FilterHashtable @{LogName='Security';ID=4625} -MaxEvents 15 -ErrorAction SilentlyContinue |
+        Select-Object TimeCreated,Id,ProviderName | Format-Table -AutoSize
+}
+Invoke-Check '31 - Suspicious filenames in commonly used folders' {
+    $roots = @($desktop, 'C:\Users\Public', 'C:\ProgramData')
+    $pattern = '(?i)netcat|ncat|wireshark|nmap|mimikatz|keylog|backdoor|password|credential|secret|\.mp3$|\.mp4$|\.torrent$'
+    foreach ($root in $roots) {
+        if (Test-Path -LiteralPath $root) {
+            Get-ChildItem -LiteralPath $root -File -Force -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match $pattern -and $_.FullName -notmatch '\\AppData\\Local\\Packages\\' } |
+                Select-Object -First 150 FullName,Length,LastWriteTime | Format-Table -AutoSize -Wrap
+        }
+    }
+}
+if ($Deep) {
+    Invoke-Check '32 - DEEP: additional filenames under user profiles' {
+        $pattern = '(?i)netcat|ncat|wireshark|nmap|mimikatz|keylog|backdoor|password|credential|secret|\.mp3$|\.mp4$|\.torrent$'
+        Get-ChildItem 'C:\Users' -Recurse -Force -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $pattern -and $_.FullName -notmatch '\\AppData\\Local\\Packages\\' } |
+            Select-Object -First 500 FullName,Length,LastWriteTime | Format-Table -AutoSize -Wrap
+    }
+}
+Write-Report ''
+Write-Report ('Completed: {0}' -f (Get-Date))
+Write-Report ('Report path: {0}' -f $report)
+Write-Host ''
+Write-Host 'AUDIT FINISHED - no security settings were changed.' -ForegroundColor Green
+Write-Host ('REPORT: {0}' -f $report) -ForegroundColor Cyan
